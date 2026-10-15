@@ -225,6 +225,8 @@ static FILE *outfile;			/* output file */
 static INT prtlinenum;			/* formatted output print line number */
 static UCHAR xrefflg;			/* cross reference flag */
 static INT xrefhandle;			/* cross reference work file handle */
+static UCHAR optimizepassflg;		/* run optimizer-style liveness pass */
+static UCHAR optimizedumpflg;		/* developer report for routines/variables */
 static UCHAR libcnt;			/* number of library files */
 static CHAR libname[3][MAXNAM];	/* library file names */
 static UINT totlines;			/* total number of lines compiled */
@@ -364,6 +366,7 @@ static void putclsdata(UCHAR *, INT);
 static void putclsdatalmh(INT);
 static void putclsdataout(void);
 static void quitsig(INT);
+static void runUnusedSymbolOptimization(void);
 static void savemain(void);
 static void startdbc(void);
 static void stats(void);
@@ -532,6 +535,7 @@ static INT dbcmpmain(INT argc, CHAR **argv)
 	startdbc();
 	compile();
 	checknesting();
+	runUnusedSymbolOptimization();
 	writedbc();
 	if (errcnt && removeflg) {
 		if (dbgflg) riokill(dbgfilenum);
@@ -578,6 +582,153 @@ static INT dbcmpinit()
 	return 0;
 }
 
+static INT symbolNameInReferenceTable(const UCHAR *table, UINT size, const CHAR *symbol)
+{
+	UINT i, j, symlen;
+
+	if (table == NULL || size <= 4 || symbol == NULL || symbol[0] == '\0') return FALSE;
+	symlen = (UINT) strlen(symbol);
+	for (i = 4; i < size; ) {
+		if (i + 1 >= size) break;
+		i++;
+		for (j = 0; i + j < size && table[i + j] != '\0'; j++);
+		if (i + j >= size) break;
+		if (j == symlen && !memcmp(&table[i], symbol, symlen)) return TRUE;
+		i += j + 1;
+	}
+	return FALSE;
+}
+
+static INT symbolNameInDefinitionTable(const UCHAR *table, UINT size, const CHAR *symbol)
+{
+	UINT i, j, symlen;
+
+	if (table == NULL || size <= 4 || symbol == NULL || symbol[0] == '\0') return FALSE;
+	symlen = (UINT) strlen(symbol);
+	for (i = 4; i < size; ) {
+		if (i + 3 >= size) break;
+		i += 3;
+		for (j = 0; i + j < size && table[i + j] != '\0'; j++);
+		if (i + j >= size) break;
+		if (j == symlen && !memcmp(&table[i], symbol, symlen)) return TRUE;
+		i += j + 1;
+	}
+	return FALSE;
+}
+
+static INT isDeadNameInList(CHAR **deadnames, UINT deadcount, const CHAR *symbol)
+{
+	UINT i;
+
+	if (deadnames == NULL || deadcount == 0 || symbol == NULL) return FALSE;
+	for (i = 0; i < deadcount; i++) {
+		if (deadnames[i] != NULL && !strcmp(deadnames[i], symbol)) return TRUE;
+	}
+	return FALSE;
+}
+
+static void pruneDeadDefinitionTable(UCHAR ***table, UINT *size, CHAR **deadnames, UINT deadcount)
+{
+	UCHAR *worktable, *srcptr;
+	UINT i, j, outpos, entrylen;
+	CHAR work[256];
+
+	if (table == NULL || *table == NULL || **table == NULL || size == NULL || *size <= 4 || deadcount == 0) return;
+	worktable = (UCHAR *) malloc(*size);
+	if (worktable == NULL) return;
+	srcptr = **table;
+	memcpy(worktable, srcptr, *size);
+	outpos = 4;
+	for (i = 4; i < *size; ) {
+		if (i + 3 >= *size) break;
+		entrylen = 3;
+		for (j = i + 3; j < *size && srcptr[j] != '\0'; j++) entrylen++;
+		if (j >= *size) break;
+		entrylen++;
+		if (entrylen > 0 && (INT) strlen((CHAR *) (srcptr + i + 3)) > 0) {
+			memcpy(work, srcptr + i + 3, entrylen - 3);
+			work[entrylen - 3] = '\0';
+			if (!isDeadNameInList(deadnames, deadcount, work)) {
+				memcpy(worktable + outpos, srcptr + i, entrylen);
+				outpos += entrylen;
+			}
+		}
+		i += entrylen;
+	}
+	memfree(*table);
+	**table = worktable;
+	*size = outpos;
+}
+
+static void runUnusedSymbolOptimization(void)
+{
+	UINT hashidx, routinecount = 0, deadroutinecount = 0, varcount = 0, deadvarcount = 0;
+	SYMINFO *symtableptr;
+	CHAR work[256], **deadnames = NULL;
+	UINT deadnamescnt = 0, deadnamescap = 0;
+
+	if (!optimizepassflg && !optimizedumpflg) return;
+
+	for (hashidx = 0; hashidx < SYMHASHSIZE; hashidx++) {
+		symtableptr = symtablebase[hashidx];
+		while (symtableptr != NULL) {
+			if (symtableptr->type == TYPE_PLABEL || symtableptr->type == TYPE_PLABELXDEF ||
+			    symtableptr->type == TYPE_PLABELMDEF || symtableptr->type == TYPE_PLABELMREF ||
+			    symtableptr->type == TYPE_PLABELXREF) {
+				routinecount++;
+				if (symtableptr->type == TYPE_PLABEL || symtableptr->type == TYPE_PLABELXDEF ||
+				    symtableptr->type == TYPE_PLABELMDEF) {
+					if (!symbolNameInReferenceTable((xreftable != NULL && *xreftable != NULL) ? *xreftable : NULL, xrefsize, symtableptr->nameptr)) {
+						deadroutinecount++;
+						if (deadnamescnt >= deadnamescap) {
+							deadnamescap = (deadnamescap == 0) ? 16 : deadnamescap * 2;
+							deadnames = (CHAR **) realloc(deadnames, deadnamescap * sizeof(CHAR *));
+							if (deadnames == NULL) death(DEATH_NOMEM);
+						}
+						deadnames[deadnamescnt] = symtableptr->nameptr;
+						deadnamescnt++;
+						if (optimizedumpflg) {
+							sprintf(work, "routine candidate: %s (likely unreferenced)\n", symtableptr->nameptr);
+							dspstring(work);
+						}
+					}
+					else if (optimizedumpflg) {
+						sprintf(work, "routine: %s\n", symtableptr->nameptr);
+						dspstring(work);
+					}
+				}
+			}
+			else if (symtableptr->type <= TYPE_MAXDATAVAR && symtableptr->type != TYPE_EQUATE) {
+				varcount++;
+				if (!symbolNameInReferenceTable((xreftable != NULL && *xreftable != NULL) ? *xreftable : NULL, xrefsize, symtableptr->nameptr)) {
+					deadvarcount++;
+					if (optimizedumpflg) {
+						sprintf(work, "variable candidate: %s (likely unreferenced)\n", symtableptr->nameptr);
+						dspstring(work);
+					}
+				}
+				else if (optimizedumpflg) {
+					sprintf(work, "variable: %s\n", symtableptr->nameptr);
+					dspstring(work);
+				}
+			}
+			symtableptr = symtableptr->nexthash;
+		}
+	}
+
+	if (optimizepassflg && deadroutinecount && xdeftable != NULL && *xdeftable != NULL) {
+		pruneDeadDefinitionTable(&xdeftable, &xdefsize, deadnames, deadnamescnt);
+	}
+	if (deadnames != NULL) free(deadnames);
+
+	sprintf(work, "optimizer pass: routines=%u likely-unused=%u variables=%u likely-unused=%u\n",
+		routinecount, deadroutinecount, varcount, deadvarcount);
+	dspstring(work);
+	if (optimizepassflg && deadroutinecount) {
+		dspstring("optimizer pass flagged the likely-unused routine entries above for pruning consideration.\n");
+	}
+}
+
 #define MAXCMDEQUATE 4096	/* max # of bytes on command line used for -E labels */
 
 /* PARSECMDLINE */
@@ -593,6 +744,8 @@ static INT parsecmdline()
 	upcaseflg = FALSE;
 	nofixupflg = FALSE;
 	removeflg = FALSE;
+	optimizepassflg = FALSE;
+	optimizedumpflg = FALSE;
 	liston = TRUE;
 	filedflt = ifiledflt = afiledflt = 0;
 	xmlname[0] = '\0';
@@ -728,6 +881,12 @@ static INT parsecmdline()
 			case 'N':
 				if ((pagelen = atoi(&parm[3])) <= 7) death(DEATH_BADPARMVALUE);
 				else pagelen -= 7;
+				continue;
+			case 'Y':
+				optimizepassflg = TRUE;
+				if (parm[2] == '=') {
+					if (!strncmp(&parm[3], "DEBUG", 5) || !strncmp(&parm[3], "DUMP", 4)) optimizedumpflg = TRUE;
+				}
 				continue;
 			case 'P':
 				strcpy(prtname, &parm[3]);
@@ -3634,7 +3793,7 @@ static void usage()
 	dspstring("              [-FILE=[TEXT][NATIVE][BINARY][DATA][CRLF]] [-H=header] [-I]\n");
 	dspstring("              [-IFILE=[TEXT][NATIVE][BINARY][DATA][CRLF]] [-J] [-JR]\n");
 	dspstring("              [-K] [-L=library name] [-N=nnn] [-O=filename] [-P[=filename]]\n");
-	dspstring("              [-R[=filename]] [-S[X]] [-T=filename] [-V] [-W=nnn] [-X] [-Z]\n");
+	dspstring("              [-R[=filename]] [-S[X]] [-T=filename] [-V] [-W=nnn] [-X] [-Y[=DEBUG]] [-Z]\n");
 	dspstring("              [-1] [-2] [-3] [-8] [-9]\n");
 	exit(1);
 }
