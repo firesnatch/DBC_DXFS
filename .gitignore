@@ -36,3 +36,5 @@ setupodb
 *.tdf
 .vs/
 .vscode/
+dbcmp_asan
+dbcmp_asan.dSYM
