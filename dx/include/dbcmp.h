@@ -57,6 +57,10 @@ typedef struct ctlcodestruct {
 
 EXTERN int dbcmpflags;	/* see above values */
 
+void callGraphEnterRoutine(const CHAR *name);
+void callGraphLeaveRoutine(void);
+void callGraphRecordCall(const CHAR *callee);
+
 #define RULEFNC UINT (*)(void)
 
 #define LABELSIZ 32

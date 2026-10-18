@@ -346,10 +346,12 @@ stmtloop:
 		}
 		if (label[0] && vbp->verbcode && (vbp->verbcode < 193 || vbp->verbcode > 255)) {
 			if (dbgflg) dbglblrec((INT) linecounter[inclevel], label);
-			if (vbp->verbcode == 110 && verb[0] == 'R')
-				usepsym(label, LABEL_ROUTINE);	 /* ROUTINE label */
-			else
-				if (!nocompile) usepsym(label, LABEL_DEF);	 /* LROUTINE or other label */
+			if (vbp->verbcode == 110) {
+				if (verb[0] == 'R') usepsym(label, LABEL_ROUTINE); /* ROUTINE label */
+				else if (!nocompile) usepsym(label, LABEL_DEF); /* LROUTINE */
+				callGraphEnterRoutine(label);
+			}
+			else if (!nocompile) usepsym(label, LABEL_DEF); /* non-routine label */
 		}
 		codebufcnt = 0;
 		if (vbp->verbcode > 255) putcodehhll(vbp->verbcode);

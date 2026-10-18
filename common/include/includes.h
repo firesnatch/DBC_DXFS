@@ -34,7 +34,7 @@
 #define OS_WIN32GUI 0
 #endif
 
-#if defined(UNIX) || defined(unix) || defined (__unix) || defined(__MACOSX)
+#if defined(UNIX) || defined(unix) || defined(__unix) || defined(__linux__) || defined(__linux) || defined(linux) || defined(Linux) || defined(__MACOSX) || defined(__APPLE__)
 #define OS_UNIX 1
 #else
 #define OS_UNIX 0

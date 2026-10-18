@@ -224,6 +224,8 @@ static UCHAR incopt;			/* 1, 2, 3, 4 special processing for include file names *
 static FILE *outfile;			/* output file */
 static INT prtlinenum;			/* formatted output print line number */
 static UCHAR xrefflg;			/* cross reference flag */
+static UCHAR optimizepassflg;		/* run optimizer reachability report */
+static UCHAR optimizedumpflg;		/* dump routine/variable removal candidates */
 static INT xrefhandle;			/* cross reference work file handle */
 static UCHAR libcnt;			/* number of library files */
 static CHAR libname[3][MAXNAM];	/* library file names */
@@ -233,6 +235,26 @@ static UINT externalReferencesTableSizeInBytes;
 static UINT externalDefinitionsTableCountOfEntries;
 static UINT externalReferencesTableCountOfEntries;
 static USHORT executionLabelTableCount;
+
+#define CALLGRAPH_INITIAL_CAPACITY 32
+
+typedef struct callgraphnodedata {
+	CHAR *name;
+	INT *edges;
+	INT edgecount;
+	INT edgecap;
+	INT start;
+	INT end;
+	UCHAR removable;
+} CALLGRAPHNODE;
+
+static CALLGRAPHNODE *callgraphnodes;
+static INT callgraphcount;
+static INT callgraphcap;
+static INT callgraphentrynode = -1;
+static INT callgraphstackdepth;
+static INT callgraphstack[RLEVELMAX];
+
 UINT linecounter[MAXINC + 1]; 	/* linecounter for current include level */
 static INT filetable[MAXINC + 1];	/* include file handle for each level */
 INT inclevel = -1;				/* current include level  0 = main program */
@@ -341,6 +363,14 @@ static void addxdef(CHAR *, INT);
 static INT addxref(CHAR *, INT, INT);
 static INT dbcmpinit(void);
 static INT dbcmpmain(INT argc, CHAR **argv);
+CHAR *callGraphDupString(const CHAR *text);
+INT callGraphFindNodeIndex(const CHAR *name);
+INT callGraphEnsureNode(const CHAR *name);
+INT callGraphCurrentRoutineIndex(void);
+void callGraphEnterRoutine(const CHAR *name);
+void callGraphLeaveRoutine(void);
+void callGraphRecordCall(const CHAR *callee);
+INT callGraphBuildReachability(INT *reachable);
 static void dbgclassrec(CHAR *);
 static void dbgdatarec(INT, CHAR *);
 static void dbgendclassrec(void);
@@ -355,6 +385,8 @@ static void outputs(CHAR *);
 static void outputns(INT, CHAR *);
 static INT parsecmdline(void);
 static void processWarningArgument(INT parmlen);
+static INT symbolNameInReferenceTable(SYMINFO *symbol);
+static void runUnusedSymbolOptimization(void);
 static void putdatalmh(INT);
 static void putdataout(void);
 static void putclsdata1(UINT);
@@ -532,6 +564,7 @@ static INT dbcmpmain(INT argc, CHAR **argv)
 	startdbc();
 	compile();
 	checknesting();
+	if (optimizepassflg) runUnusedSymbolOptimization();
 	writedbc();
 	if (errcnt && removeflg) {
 		if (dbgflg) riokill(dbgfilenum);
@@ -578,6 +611,444 @@ static INT dbcmpinit()
 	return 0;
 }
 
+CHAR *callGraphDupString(const CHAR *text)
+{
+	CHAR *copy;
+	size_t len;
+	if (text == NULL || !text[0]) return NULL;
+	len = strlen(text) + 1;
+	copy = (CHAR *) malloc(len);
+	if (copy != NULL) memcpy(copy, text, len);
+	return copy;
+}
+
+INT callGraphFindNodeIndex(const CHAR *name)
+{
+	INT i;
+	if (name == NULL || !name[0]) return -1;
+	for (i = 0; i < callgraphcount; i++) {
+		if (callgraphnodes[i].name != NULL && !strcmp(callgraphnodes[i].name, name)) return i;
+	}
+	return -1;
+}
+
+INT callGraphEnsureNode(const CHAR *name)
+{
+	INT idx;
+	CALLGRAPHNODE *newnodes;
+	if (name == NULL || !name[0]) return -1;
+	idx = callGraphFindNodeIndex(name);
+	if (idx >= 0) return idx;
+	if (callgraphcount >= callgraphcap) {
+		INT newcap = callgraphcap ? callgraphcap * 2 : CALLGRAPH_INITIAL_CAPACITY;
+		newnodes = (CALLGRAPHNODE *) realloc(callgraphnodes, (size_t) newcap * sizeof(CALLGRAPHNODE));
+		if (newnodes == NULL) return -1;
+		callgraphnodes = newnodes;
+		callgraphcap = newcap;
+	}
+	callgraphnodes[callgraphcount].name = callGraphDupString(name);
+	callgraphnodes[callgraphcount].edges = NULL;
+	callgraphnodes[callgraphcount].edgecount = 0;
+	callgraphnodes[callgraphcount].edgecap = 0;
+	callgraphnodes[callgraphcount].start = -1;
+	callgraphnodes[callgraphcount].end = -1;
+	callgraphnodes[callgraphcount].removable = FALSE;
+	return callgraphcount++;
+}
+
+INT callGraphCurrentRoutineIndex(void)
+{
+	if (callgraphstackdepth <= 0) return -1;
+	return callgraphstack[callgraphstackdepth - 1];
+}
+
+void callGraphEnterRoutine(const CHAR *name)
+{
+	INT idx;
+	if (name == NULL || !name[0]) return;
+	idx = callGraphEnsureNode(name);
+	if (idx < 0) return;
+	if (callgraphstackdepth >= (INT) (sizeof(callgraphstack) / sizeof(callgraphstack[0]))) return;
+	callgraphnodes[idx].start = codeadr;
+	callgraphnodes[idx].end = -1;
+	callgraphstack[callgraphstackdepth++] = idx;
+}
+
+void callGraphLeaveRoutine(void)
+{
+	INT idx;
+	if (callgraphstackdepth <= 0) return;
+	idx = callgraphstack[--callgraphstackdepth];
+	callgraphnodes[idx].end = codeadr;
+}
+
+static INT callGraphEntryNode(void)
+{
+	if (callgraphentrynode >= 0) return callgraphentrynode;
+	callgraphentrynode = callGraphEnsureNode("__DBCMP_ENTRY__");
+	return callgraphentrynode;
+}
+
+void callGraphRecordCall(const CHAR *callee)
+{
+	INT calleridx, calleeidx, i;
+	INT *newedges;
+	if (callee == NULL || !callee[0]) return;
+	calleridx = callGraphCurrentRoutineIndex();
+	if (calleridx < 0) calleridx = callGraphEntryNode();
+	calleeidx = callGraphEnsureNode(callee);
+	if (calleridx < 0 || calleeidx < 0) return;
+	for (i = 0; i < callgraphnodes[calleridx].edgecount; i++) {
+		if (callgraphnodes[calleridx].edges[i] == calleeidx) return;
+	}
+	if (callgraphnodes[calleridx].edgecount >= callgraphnodes[calleridx].edgecap) {
+		INT newcap = callgraphnodes[calleridx].edgecap ? callgraphnodes[calleridx].edgecap * 2 : 8;
+		newedges = (INT *) realloc(callgraphnodes[calleridx].edges, (size_t) newcap * sizeof(INT));
+		if (newedges == NULL) return;
+		callgraphnodes[calleridx].edges = newedges;
+		callgraphnodes[calleridx].edgecap = newcap;
+	}
+	callgraphnodes[calleridx].edges[callgraphnodes[calleridx].edgecount++] = calleeidx;
+}
+
+INT callGraphBuildReachability(INT *reachable)
+{
+	INT *indegree, *queue, head, tail, i, total = 0;
+	if (reachable == NULL) return 0;
+	for (i = 0; i < callgraphcount; i++) {
+		if (callgraphnodes[i].name != NULL) total++;
+	}
+	if (total == 0) return 0;
+	indegree = (INT *) calloc((size_t) total, sizeof(INT));
+	queue = (INT *) malloc((size_t) total * sizeof(INT));
+	if (indegree == NULL || queue == NULL) {
+		free(indegree);
+		free(queue);
+		return 0;
+	}
+	memset(reachable, 0, (size_t) total * sizeof(INT));
+	for (i = 0; i < callgraphcount; i++) {
+		INT e;
+		for (e = 0; e < callgraphnodes[i].edgecount; e++) {
+			INT target = callgraphnodes[i].edges[e];
+			if (target >= 0 && target < total) indegree[target]++;
+		}
+	}
+	head = tail = 0;
+	if (callgraphentrynode >= 0 && callgraphentrynode < total) {
+		queue[tail++] = callgraphentrynode;
+		reachable[callgraphentrynode] = 1;
+	}
+	else {
+		for (i = 0; i < total; i++) {
+			if (indegree[i] == 0) {
+				queue[tail++] = i;
+				reachable[i] = 1;
+			}
+		}
+	}
+	while (head < tail) {
+		INT current = queue[head++];
+		for (i = 0; i < callgraphnodes[current].edgecount; i++) {
+			INT target = callgraphnodes[current].edges[i];
+			if (target >= 0 && target < total && !reachable[target]) {
+				reachable[target] = 1;
+				queue[tail++] = target;
+			}
+		}
+	}
+	free(indegree);
+	free(queue);
+	return total;
+}
+
+static INT symbolNameInReferenceTable(SYMINFO *symbol)
+{
+	UINT hashval;
+	USHORT symlen;
+	SYMINFO *symtableptr;
+
+	if (symbol == NULL || symbol->nameptr == NULL || !symbol->nameptr[0]) return FALSE;
+	hashval = symhashfunct(symbol->nameptr, &symlen);
+	if (NULL == symtablebase[hashval]) return FALSE;
+	symtableptr = symtablebase[hashval] + symtableoffset[hashval];
+	while (symtableptr != NULL) {
+		if (symtableptr != symbol && symtableptr->len == symlen && !memcmp(symtableptr->nameptr, symbol->nameptr, symlen)) {
+			if (symtableptr->type == TYPE_PLABELXREF || symtableptr->type == TYPE_PLABELMREF ||
+			    symtableptr->type == TYPE_PLABELVAR || symtableptr->type == TYPE_PLABEL ||
+			    symtableptr->type == TYPE_PLABELXDEF || symtableptr->type == TYPE_PLABELMDEF ||
+			    symtableptr->type < TYPE_MAXDATAVAR) {
+				return TRUE;
+			}
+		}
+		symtableptr = symtableptr->nexthash;
+	}
+	return FALSE;
+}
+
+static INT codeRangeContains(INT value, INT *ranges, INT rangecount)
+{
+	INT i;
+	for (i = 0; i < rangecount; i++) {
+		if (value >= ranges[i * 2] && value < ranges[i * 2 + 1]) return TRUE;
+	}
+	return FALSE;
+}
+
+static INT cmpCodeRanges(const void *left, const void *right)
+{
+	const INT *a = (const INT *) left;
+	const INT *b = (const INT *) right;
+	if (a[0] < b[0]) return -1;
+	if (a[0] > b[0]) return 1;
+	if (a[1] < b[1]) return -1;
+	if (a[1] > b[1]) return 1;
+	return 0;
+}
+
+static INT codeRangeRemovedBefore(INT value, INT *ranges, INT rangecount)
+{
+	INT i, removed = 0;
+	for (i = 0; i < rangecount; i++) {
+		if (value >= ranges[i * 2 + 1]) removed += ranges[i * 2 + 1] - ranges[i * 2];
+	}
+	return removed;
+}
+
+static INT applyProvenRoutinePruning(void)
+{
+	INT i, rangecount = 0, oldlen, newlen, removedcount = 0, *ranges = NULL;
+	INT remainingrange = 0;
+	INT outpos, outfixup, fixupslots;
+	UINT labelnum, coderef;
+	UCHAR *oldbuf = NULL, *newbuf = NULL, *newfixupbuf = NULL;
+	OFFSET pos;
+	INT nread;
+
+	for (i = 0; i < callgraphcount; i++) {
+		if (callgraphnodes[i].name == NULL || strcmp(callgraphnodes[i].name, "__DBCMP_ENTRY__") == 0) continue;
+		if (!callgraphnodes[i].removable) continue;
+		if (callgraphnodes[i].start < 0 || callgraphnodes[i].end < callgraphnodes[i].start) continue;
+		rangecount++;
+	}
+	if (!rangecount) return 0;
+
+	ranges = (INT *) calloc((size_t) rangecount * 2, sizeof(INT));
+	if (ranges == NULL) return 0;
+	for (i = 0; i < callgraphcount && remainingrange < rangecount * 2; i++) {
+		if (callgraphnodes[i].name == NULL || strcmp(callgraphnodes[i].name, "__DBCMP_ENTRY__") == 0) continue;
+		if (!callgraphnodes[i].removable) continue;
+		if (callgraphnodes[i].start < 0 || callgraphnodes[i].end < callgraphnodes[i].start) continue;
+		ranges[remainingrange++] = callgraphnodes[i].start;
+		ranges[remainingrange++] = callgraphnodes[i].end;
+	}
+	if (rangecount > 1) {
+		INT mergedcount = 0;
+		qsort(ranges, (size_t) rangecount, sizeof(INT) * 2, cmpCodeRanges);
+		for (i = 0; i < rangecount; i++) {
+			INT start = ranges[i * 2];
+			INT end = ranges[i * 2 + 1];
+			if (mergedcount > 0 && start <= ranges[(mergedcount - 1) * 2 + 1]) {
+				if (end > ranges[(mergedcount - 1) * 2 + 1]) ranges[(mergedcount - 1) * 2 + 1] = end;
+			}
+			else {
+				ranges[mergedcount * 2] = start;
+				ranges[mergedcount * 2 + 1] = end;
+				mergedcount++;
+			}
+		}
+		rangecount = mergedcount;
+	}
+
+	oldlen = mainbufhandle ? (INT) mainfilepos : (INT) mainbufcnt;
+	if (oldlen <= 0) {
+		free(ranges);
+		return 0;
+	}
+	for (i = 0; i < rangecount * 2; i += 2) removedcount += ranges[i + 1] - ranges[i];
+	newlen = oldlen - removedcount;
+	if (newlen <= 0) {
+		free(ranges);
+		return 0;
+	}
+
+	oldbuf = (UCHAR *) malloc((size_t) oldlen);
+	if (oldbuf == NULL) {
+		free(ranges);
+		return 0;
+	}
+	if (mainbufhandle) {
+		for (pos = 0; pos < (OFFSET) oldlen; ) {
+			nread = fioread(mainbufhandle, pos, oldbuf + pos, oldlen - (INT) pos);
+			if (nread <= 0) break;
+			pos += nread;
+		}
+	}
+	else {
+		memcpy(oldbuf, *mainbufpptr, (size_t) oldlen);
+	}
+
+	newbuf = (UCHAR *) malloc((size_t) newlen);
+	if (newbuf == NULL) {
+		free(oldbuf);
+		free(ranges);
+		return 0;
+	}
+	for (i = outpos = 0; i < oldlen; i++) {
+		if (codeRangeContains(i, ranges, rangecount)) continue;
+		newbuf[outpos++] = oldbuf[i];
+	}
+	if (outpos != newlen) {
+		free(newbuf);
+		free(oldbuf);
+		free(ranges);
+		return 0;
+	}
+
+	if (mainbufhandle) {
+		for (pos = 0; pos < (OFFSET) newlen; ) {
+			nread = fiowrite(mainbufhandle, pos, newbuf + pos, newlen - (INT) pos);
+			if (nread <= 0) break;
+			pos += nread;
+		}
+		mainfilepos = (OFFSET) newlen;
+		mainbufcnt = 0;
+	}
+	else {
+		memchange(mainbufpptr, (UINT) newlen, 0);
+		memcpy(*mainbufpptr, newbuf, (size_t) newlen);
+		mainbufcnt = (UINT) newlen;
+	}
+	free(newbuf);
+	free(oldbuf);
+
+	for (i = 0; i < (INT) simplelabelnext; i++) {
+		INT value = (*simplelabeltable)[i];
+		if (value >= 0x01000000) continue;
+		if (codeRangeContains(value, ranges, rangecount)) (*simplelabeltable)[i] = 0;
+		else (*simplelabeltable)[i] = value - codeRangeRemovedBefore(value, ranges, rangecount);
+	}
+
+	fixupslots = simplefixupnext / (2 * (INT) sizeof(UINT));
+	newfixupbuf = (UCHAR *) calloc((size_t) ((size_t) fixupslots * 2 * sizeof(UINT) + 8), 1);
+	if (newfixupbuf != NULL) {
+		for (outfixup = 0, i = 0; i < simplefixupnext; i += (INT) (2 * sizeof(UINT))) {
+			labelnum = load4hhll(*simplefixuptable + i);
+			coderef = load4hhll(*simplefixuptable + i + sizeof(UINT));
+			if (codeRangeContains((INT) coderef, ranges, rangecount)) continue;
+			coderef -= codeRangeRemovedBefore((INT) coderef, ranges, rangecount);
+			move4hhll(labelnum, newfixupbuf + outfixup);
+			move4hhll(coderef, newfixupbuf + outfixup + sizeof(UINT));
+			outfixup += 2 * sizeof(UINT);
+		}
+		if (simplefixuptable != NULL) {
+			memchange(simplefixuptable, (UINT) outfixup ? (UINT) outfixup : 16, 0);
+			if (outfixup) memcpy(*simplefixuptable, newfixupbuf, (size_t) outfixup);
+		}
+		simplefixupnext = outfixup;
+		simplefixupsize = outfixup ? outfixup : 16;
+		free(newfixupbuf);
+	}
+
+	codeadr -= removedcount;
+	free(ranges);
+	return rangecount;
+}
+
+static void runUnusedSymbolOptimization(void)
+{
+	UINT hashval;
+	SYMINFO *symtableptr;
+	INT routinecount = 0, reachablecount = 0, unknownroutinecount = 0, removablecount = 0;
+	INT varcount = 0, candidatevarcount = 0, unknownvarcount = 0;
+	INT localvarcount = 0, globalvarcount = 0, classmembercount = 0;
+	INT *reachable = NULL;
+	CHAR work[512];
+	INT graphnodes = callgraphcount;
+	INT graphroutinecount = 0;
+	INT prunedcount = 0;
+
+	for (hashval = 0; hashval < SYMHASHSIZE; hashval++) {
+		if (NULL == symtablebase[hashval]) continue;
+		symtableptr = symtablebase[hashval] + symtableoffset[hashval];
+		while (symtableptr != NULL) {
+			if (symtableptr->type == TYPE_PLABEL || symtableptr->type == TYPE_PLABELXDEF || symtableptr->type == TYPE_PLABELMDEF) {
+				routinecount++;
+				if (symbolNameInReferenceTable(symtableptr)) {
+					reachablecount++;
+				}
+				else {
+					unknownroutinecount++;
+					if (optimizedumpflg) {
+						memset(work, 0, sizeof(work));
+						sprintf(work, "optimizer: routine %.*s is unknown to this reachability pass (no proven call graph)\n",
+							symtableptr->len, symtableptr->nameptr);
+						dspstring(work);
+					}
+				}
+			}
+			else if (symtableptr->type < TYPE_MAXDATAVAR && symtableptr->type != TYPE_EQUATE) {
+				varcount++;
+				if (symtableptr->rlevel == 0) globalvarcount++;
+				else if (symtableptr->classid != 0) classmembercount++;
+				else localvarcount++;
+				if (symbolNameInReferenceTable(symtableptr)) {
+					/* variable is referenced; no candidate removal proof */
+				}
+				else if (symtableptr->rlevel > 0 && symtableptr->classid == 0) {
+					candidatevarcount++;
+					if (optimizedumpflg) {
+						memset(work, 0, sizeof(work));
+						sprintf(work, "optimizer: variable %.*s is a likely-unused routine-local variable candidate (no proven usage chain)\n",
+							symtableptr->len, symtableptr->nameptr);
+						dspstring(work);
+					}
+				}
+				else {
+					unknownvarcount++;
+					if (optimizedumpflg) {
+						memset(work, 0, sizeof(work));
+						sprintf(work, "optimizer: variable %.*s is not a safe removal candidate under this analysis (scope=%s)\n",
+							symtableptr->len, symtableptr->nameptr,
+							(symtableptr->rlevel == 0) ? "global" : "class-member");
+						dspstring(work);
+					}
+				}
+			}
+			symtableptr = symtableptr->nexthash;
+		}
+	}
+	if (graphnodes > 0) {
+		INT i;
+		for (i = 0; i < graphnodes; i++) {
+			if (callgraphnodes[i].name != NULL && strcmp(callgraphnodes[i].name, "__DBCMP_ENTRY__")) graphroutinecount++;
+		}
+		if (graphroutinecount < routinecount) unknownroutinecount = routinecount - graphroutinecount;
+		reachable = (INT *) calloc((size_t) graphnodes, sizeof(INT));
+		if (reachable != NULL) {
+			INT reachableTotal = callGraphBuildReachability(reachable);
+			for (i = 0; i < reachableTotal; i++) {
+				if (i == callgraphentrynode) continue;
+				if (reachable[i]) reachablecount++;
+			}
+			removablecount = (graphroutinecount > reachablecount) ? (graphroutinecount - reachablecount) : 0;
+			for (i = 0; i < graphnodes; i++) {
+				if (callgraphnodes[i].name == NULL || strcmp(callgraphnodes[i].name, "__DBCMP_ENTRY__") == 0) continue;
+				callgraphnodes[i].removable = (i < graphnodes && !reachable[i] && callgraphnodes[i].start >= 0 && callgraphnodes[i].end > callgraphnodes[i].start);
+			}
+			free(reachable);
+		}
+	}
+	prunedcount = applyProvenRoutinePruning();
+	if (optimizedumpflg || optimizepassflg) {
+		memset(work, 0, sizeof(work));
+		sprintf(work, "optimizer: routine summary: total=%d reachable=%d removable=%d pruned=%d unknown=%d; call-graph nodes=%d; variable summary: total=%d locals=%d globals=%d class-members=%d candidates=%d unknown=%d; actual pruning enabled for proven unreachable routines\n",
+			routinecount, reachablecount, removablecount, prunedcount, unknownroutinecount, graphnodes,
+			varcount, localvarcount, globalvarcount, classmembercount, candidatevarcount, unknownvarcount);
+		dspstring(work);
+	}
+}
+
 #define MAXCMDEQUATE 4096	/* max # of bytes on command line used for -E labels */
 
 /* PARSECMDLINE */
@@ -593,6 +1064,8 @@ static INT parsecmdline()
 	upcaseflg = FALSE;
 	nofixupflg = FALSE;
 	removeflg = FALSE;
+	optimizepassflg = FALSE;
+	optimizedumpflg = FALSE;
 	liston = TRUE;
 	filedflt = ifiledflt = afiledflt = 0;
 	xmlname[0] = '\0';
@@ -728,6 +1201,12 @@ static INT parsecmdline()
 			case 'N':
 				if ((pagelen = atoi(&parm[3])) <= 7) death(DEATH_BADPARMVALUE);
 				else pagelen -= 7;
+				continue;
+			case 'Y':
+				optimizepassflg = TRUE;
+				if (parm[2] == '=') {
+					if (!strncmp(&parm[3], "DEBUG", 5) || !strncmp(&parm[3], "DUMP", 4)) optimizedumpflg = TRUE;
+				}
 				continue;
 			case 'P':
 				strcpy(prtname, &parm[3]);
@@ -3634,7 +4113,7 @@ static void usage()
 	dspstring("              [-FILE=[TEXT][NATIVE][BINARY][DATA][CRLF]] [-H=header] [-I]\n");
 	dspstring("              [-IFILE=[TEXT][NATIVE][BINARY][DATA][CRLF]] [-J] [-JR]\n");
 	dspstring("              [-K] [-L=library name] [-N=nnn] [-O=filename] [-P[=filename]]\n");
-	dspstring("              [-R[=filename]] [-S[X]] [-T=filename] [-V] [-W=nnn] [-X] [-Z]\n");
+	dspstring("              [-R[=filename]] [-S[X]] [-T=filename] [-V] [-W=nnn] [-X] [-Y[=DEBUG]] [-Z]\n");
 	dspstring("              [-1] [-2] [-3] [-8] [-9]\n");
 	exit(1);
 }

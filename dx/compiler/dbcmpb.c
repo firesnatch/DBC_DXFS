@@ -2372,6 +2372,7 @@ UINT s_routine_fnc()
 			}
 			if (dbgflg) dbgendrec();
 			rlevel--;
+			callGraphLeaveRoutine();
 			return(NEXT_TERMINATE);
 		}
 		if (tokentype != TOKEN_WORD && tokentype != TOKEN_TILDE) {
@@ -2519,6 +2520,10 @@ static UINT s_call_fnc()
 			if (TYPE_PLABELMREF == symtype && !childclsflag) {
 				error(ERROR_BADMETHODCALL);
 				return(NEXT_TERMINATE);
+			}
+			if (TYPE_PLABEL == symtype || TYPE_PLABELXREF == symtype || TYPE_PLABELXDEF == symtype ||
+			    TYPE_PLABELMDEF == symtype) {
+				callGraphRecordCall((CHAR *) token);
 			}
 			calllabel = symvalue;
 			sc = CALLSTATE_PARSEIFPREP;
