@@ -2358,11 +2358,6 @@ UINT s_routine_fnc()
 				dbgrtnrec(label);
 				dbglinerec((INT) savlinecnt, savcodeadr);
 			}
-			if (rlevel + 1 >= RLEVELMAX) {
-				error(ERROR_ROUTINEDEPTH);
-				return(NEXT_TERMINATE);
-			}
-			rlevelid[++rlevel] = ++rlevelidcnt;
 		}
 		else {				 /* endroutine */
 			codebufcnt = 0;

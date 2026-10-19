@@ -245,6 +245,7 @@ typedef struct callgraphnodedata {
 	INT edgecap;
 	INT start;
 	INT end;
+	UINT routineid;
 	UCHAR removable;
 } CALLGRAPHNODE;
 
@@ -254,6 +255,8 @@ static INT callgraphcap;
 static INT callgraphentrynode = -1;
 static INT callgraphstackdepth;
 static INT callgraphstack[RLEVELMAX];
+static UCHAR *deadroutineidmap;
+static INT deadroutineidmapcap;
 
 UINT linecounter[MAXINC + 1]; 	/* linecounter for current include level */
 static INT filetable[MAXINC + 1];	/* include file handle for each level */
@@ -652,6 +655,7 @@ INT callGraphEnsureNode(const CHAR *name)
 	callgraphnodes[callgraphcount].edgecap = 0;
 	callgraphnodes[callgraphcount].start = -1;
 	callgraphnodes[callgraphcount].end = -1;
+	callgraphnodes[callgraphcount].routineid = 0;
 	callgraphnodes[callgraphcount].removable = FALSE;
 	return callgraphcount++;
 }
@@ -662,13 +666,34 @@ INT callGraphCurrentRoutineIndex(void)
 	return callgraphstack[callgraphstackdepth - 1];
 }
 
+static void callGraphEnsureRoutineMapSlot(UINT routineid)
+{
+	INT newcap;
+	UCHAR *newmap;
+	if (routineid >= (UINT) deadroutineidmapcap) {
+		newcap = (INT) (routineid + 1);
+		newmap = (UCHAR *) calloc((size_t) newcap, sizeof(UCHAR));
+		if (newmap == NULL) return;
+		if (deadroutineidmap != NULL) {
+			memcpy(newmap, deadroutineidmap, (size_t) deadroutineidmapcap * sizeof(UCHAR));
+			free(deadroutineidmap);
+		}
+		deadroutineidmap = newmap;
+		deadroutineidmapcap = newcap;
+	}
+}
+
 void callGraphEnterRoutine(const CHAR *name)
 {
 	INT idx;
+	UINT routineid;
 	if (name == NULL || !name[0]) return;
 	idx = callGraphEnsureNode(name);
 	if (idx < 0) return;
 	if (callgraphstackdepth >= (INT) (sizeof(callgraphstack) / sizeof(callgraphstack[0]))) return;
+	routineid = rlevelid[rlevel];
+	callGraphEnsureRoutineMapSlot(routineid);
+	callgraphnodes[idx].routineid = routineid;
 	callgraphnodes[idx].start = codeadr;
 	callgraphnodes[idx].end = -1;
 	callgraphstack[callgraphstackdepth++] = idx;
@@ -784,6 +809,181 @@ static INT symbolNameInReferenceTable(SYMINFO *symbol)
 		symtableptr = symtableptr->nexthash;
 	}
 	return FALSE;
+}
+
+static INT variableIsInProvenDeadRoutine(SYMINFO *symbol)
+{
+	if (symbol == NULL || symbol->type >= TYPE_MAXDATAVAR || symbol->type == TYPE_EQUATE) return FALSE;
+	if (symbol->rlevel <= 0 || symbol->classid != 0) return FALSE;
+	if (symbol->routineid >= (UINT) deadroutineidmapcap) return FALSE;
+	return deadroutineidmap != NULL && deadroutineidmap[symbol->routineid];
+}
+
+static INT variableHasMatchingRoutineSymbol(SYMINFO *symbol)
+{
+	UINT hashval;
+	SYMINFO *symtableptr;
+	if (symbol == NULL || symbol->rlevel <= 0) return FALSE;
+	for (hashval = 0; hashval < SYMHASHSIZE; hashval++) {
+		if (NULL == symtablebase[hashval]) continue;
+		symtableptr = symtablebase[hashval] + symtableoffset[hashval];
+		while (symtableptr != NULL) {
+			if ((symtableptr->type == TYPE_PLABEL || symtableptr->type == TYPE_PLABELXDEF || symtableptr->type == TYPE_PLABELMDEF) &&
+			    symtableptr->rlevel == symbol->rlevel && symtableptr->routineid == symbol->routineid) {
+				return TRUE;
+			}
+			symtableptr = symtableptr->nexthash;
+		}
+	}
+	return FALSE;
+}
+
+static INT pruneDeadRoutineLocalVariables(void)
+{
+	UINT hashval;
+	SYMINFO *symtableptr;
+	INT removed = 0;
+
+	for (hashval = 0; hashval < SYMHASHSIZE; hashval++) {
+		if (symtablebase[hashval] == NULL) continue;
+		symtableptr = symtablebase[hashval] + symtableoffset[hashval];
+		while (symtableptr != NULL) {
+			if (symtableptr->type < TYPE_MAXDATAVAR && symtableptr->type != TYPE_EQUATE &&
+			    symtableptr->rlevel > 0 && symtableptr->classid == 0 &&
+			    variableIsInProvenDeadRoutine(symtableptr)) {
+				symtableptr->type = TYPE_EQUATE;
+				symtableptr->rlevel = 0;
+				symtableptr->classid = 0;
+				symtableptr->routineid = 0;
+				symtableptr->u2.dataadr = 0;
+				removed++;
+			}
+			symtableptr = symtableptr->nexthash;
+		}
+	}
+	return removed;
+}
+
+static INT *deadDataRanges = NULL;
+static INT deadDataRangeCount = 0;
+
+static INT cmpIntValues(const void *left, const void *right)
+{
+	const INT *a = (const INT *) left;
+	const INT *b = (const INT *) right;
+	if (*a < *b) return -1;
+	if (*a > *b) return 1;
+	return 0;
+}
+
+static INT compactDeadRoutineLocalData(void)
+{
+	UINT hashval;
+	SYMINFO *symtableptr;
+	INT *allstarts = NULL, *deadstarts = NULL, *ranges = NULL;
+	INT allcount = 0, deadcount = 0, rangecount = 0;
+	INT i, j, removed = 0;
+	INT nextstart, startpos;
+
+	if (deadDataRanges != NULL) {
+		free(deadDataRanges);
+		deadDataRanges = NULL;
+	}
+	deadDataRangeCount = 0;
+	if (dataadr <= 0) return 0;
+	allstarts = (INT *) calloc((size_t) (cursyminfo + 1), sizeof(INT));
+	deadstarts = (INT *) calloc((size_t) (cursyminfo + 1), sizeof(INT));
+	if (allstarts == NULL || deadstarts == NULL) {
+		free(allstarts);
+		free(deadstarts);
+		return 0;
+	}
+	for (hashval = 0; hashval < SYMHASHSIZE; hashval++) {
+		if (symtablebase[hashval] == NULL) continue;
+		symtableptr = symtablebase[hashval] + symtableoffset[hashval];
+		while (symtableptr != NULL) {
+			if (symtableptr->type < TYPE_MAXDATAVAR && symtableptr->type != TYPE_EQUATE &&
+			    symtableptr->u2.dataadr >= 0 && symtableptr->u2.dataadr < dataadr) {
+				allstarts[allcount++] = symtableptr->u2.dataadr;
+				if (symtableptr->rlevel > 0 && symtableptr->classid == 0 && variableIsInProvenDeadRoutine(symtableptr)) {
+					deadstarts[deadcount++] = symtableptr->u2.dataadr;
+				}
+			}
+			symtableptr = symtableptr->nexthash;
+		}
+	}
+	if (!allcount || !deadcount) {
+		free(allstarts);
+		free(deadstarts);
+		return 0;
+	}
+	qsort(allstarts, (size_t) allcount, sizeof(INT), cmpIntValues);
+	qsort(deadstarts, (size_t) deadcount, sizeof(INT), cmpIntValues);
+	ranges = (INT *) calloc((size_t) (deadcount * 2 + 2), sizeof(INT));
+	if (ranges == NULL) {
+		free(allstarts);
+		free(deadstarts);
+		return 0;
+	}
+	for (i = 0; i < deadcount; i++) {
+		startpos = deadstarts[i];
+		nextstart = dataadr;
+		for (j = 0; j < allcount; j++) {
+			if (allstarts[j] > startpos) {
+				nextstart = allstarts[j];
+				break;
+			}
+		}
+		if (nextstart <= startpos) continue;
+		ranges[rangecount * 2] = startpos;
+		ranges[rangecount * 2 + 1] = nextstart;
+		rangecount++;
+	}
+	if (!rangecount) {
+		free(allstarts);
+		free(deadstarts);
+		free(ranges);
+		return 0;
+	}
+	for (i = 0; i < rangecount; i++) {
+		removed += ranges[i * 2 + 1] - ranges[i * 2];
+	}
+	deadDataRanges = ranges;
+	deadDataRangeCount = rangecount;
+	free(allstarts);
+	free(deadstarts);
+	return removed;
+}
+
+static INT compactDataAreaBuffer(UCHAR *srcbuf, INT srcsize, UCHAR **dstbuf, INT *dstsize)
+{
+	INT i, j, outpos = 0;
+	INT removed = 0;
+	UCHAR *out = NULL;
+	if (deadDataRangeCount <= 0 || srcbuf == NULL || srcsize <= 0) {
+		*dstbuf = srcbuf;
+		*dstsize = srcsize;
+		return 0;
+	}
+	for (i = 0; i < deadDataRangeCount; i++) {
+		removed += deadDataRanges[i * 2 + 1] - deadDataRanges[i * 2];
+	}
+	out = (UCHAR *) malloc((size_t) (srcsize - removed > 0 ? srcsize - removed : 1));
+	if (out == NULL) {
+		*dstbuf = srcbuf;
+		*dstsize = srcsize;
+		return 0;
+	}
+	for (i = 0; i < srcsize; i++) {
+		for (j = 0; j < deadDataRangeCount; j++) {
+			if (i >= deadDataRanges[j * 2] && i < deadDataRanges[j * 2 + 1]) goto skip_byte;
+		}
+		out[outpos++] = srcbuf[i];
+	skip_byte:;
+	}
+	*dstbuf = out;
+	*dstsize = outpos;
+	return removed;
 }
 
 static INT codeRangeContains(INT value, INT *ranges, INT rangecount)
@@ -960,8 +1160,8 @@ static void runUnusedSymbolOptimization(void)
 	UINT hashval;
 	SYMINFO *symtableptr;
 	INT routinecount = 0, reachablecount = 0, unknownroutinecount = 0, removablecount = 0;
-	INT varcount = 0, candidatevarcount = 0, unknownvarcount = 0;
-	INT localvarcount = 0, globalvarcount = 0, classmembercount = 0;
+	INT varcount = 0, candidatevarcount = 0, unknownvarcount = 0, deadroutinevarcount = 0;
+	INT localvarcount = 0, globalvarcount = 0, classmembercount = 0, removeddeadlocals = 0;
 	INT *reachable = NULL;
 	CHAR work[512];
 	INT graphnodes = callgraphcount;
@@ -995,12 +1195,24 @@ static void runUnusedSymbolOptimization(void)
 				if (symbolNameInReferenceTable(symtableptr)) {
 					/* variable is referenced; no candidate removal proof */
 				}
+				else if (symtableptr->rlevel > 0 && symtableptr->classid == 0 && variableIsInProvenDeadRoutine(symtableptr)) {
+					deadroutinevarcount++;
+					if (optimizedumpflg) {
+						memset(work, 0, sizeof(work));
+						sprintf(work, "optimizer: variable %.*s is definitely dead because it belongs to a proven unreachable routine (rlevel=%u routineid=%u)\n",
+							symtableptr->len, symtableptr->nameptr, symtableptr->rlevel, symtableptr->routineid);
+						dspstring(work);
+					}
+				}
 				else if (symtableptr->rlevel > 0 && symtableptr->classid == 0) {
 					candidatevarcount++;
 					if (optimizedumpflg) {
 						memset(work, 0, sizeof(work));
-						sprintf(work, "optimizer: variable %.*s is a likely-unused routine-local variable candidate (no proven usage chain)\n",
-							symtableptr->len, symtableptr->nameptr);
+						sprintf(work, "optimizer: variable %.*s is a likely-unused routine-local variable candidate (no proven usage chain; rlevel=%u routineid=%u routine-match=%s dead-routine=%s)\n",
+							symtableptr->len, symtableptr->nameptr,
+							symtableptr->rlevel, symtableptr->routineid,
+							variableHasMatchingRoutineSymbol(symtableptr) ? "yes" : "no",
+							variableIsInProvenDeadRoutine(symtableptr) ? "yes" : "no");
 						dspstring(work);
 					}
 				}
@@ -1035,16 +1247,38 @@ static void runUnusedSymbolOptimization(void)
 			for (i = 0; i < graphnodes; i++) {
 				if (callgraphnodes[i].name == NULL || strcmp(callgraphnodes[i].name, "__DBCMP_ENTRY__") == 0) continue;
 				callgraphnodes[i].removable = (i < graphnodes && !reachable[i] && callgraphnodes[i].start >= 0 && callgraphnodes[i].end > callgraphnodes[i].start);
+				if (callgraphnodes[i].removable) {
+					callGraphEnsureRoutineMapSlot(callgraphnodes[i].routineid);
+					if (callgraphnodes[i].routineid < (UINT) deadroutineidmapcap) deadroutineidmap[callgraphnodes[i].routineid] = TRUE;
+				}
+			}
+			for (hashval = 0; hashval < SYMHASHSIZE; hashval++) {
+				if (symtablebase[hashval] == NULL) continue;
+				symtableptr = symtablebase[hashval] + symtableoffset[hashval];
+				while (symtableptr != NULL) {
+					if ((symtableptr->type == TYPE_PLABEL || symtableptr->type == TYPE_PLABELXDEF || symtableptr->type == TYPE_PLABELMDEF) &&
+					    symtableptr->nameptr != NULL && symtableptr->nameptr[0] &&
+					    symtableptr->routineid > 0) {
+						INT nodeidx = callGraphFindNodeIndex(symtableptr->nameptr);
+						if (nodeidx >= 0 && callgraphnodes[nodeidx].removable) {
+							callGraphEnsureRoutineMapSlot(symtableptr->routineid);
+							if (symtableptr->routineid < (UINT) deadroutineidmapcap) deadroutineidmap[symtableptr->routineid] = TRUE;
+						}
+					}
+					symtableptr = symtableptr->nexthash;
+				}
 			}
 			free(reachable);
 		}
 	}
 	prunedcount = applyProvenRoutinePruning();
+	removeddeadlocals = compactDeadRoutineLocalData();
+	removeddeadlocals += pruneDeadRoutineLocalVariables();
 	if (optimizedumpflg || optimizepassflg) {
 		memset(work, 0, sizeof(work));
-		sprintf(work, "optimizer: routine summary: total=%d reachable=%d removable=%d pruned=%d unknown=%d; call-graph nodes=%d; variable summary: total=%d locals=%d globals=%d class-members=%d candidates=%d unknown=%d; actual pruning enabled for proven unreachable routines\n",
+		sprintf(work, "optimizer: routine summary: total=%d reachable=%d removable=%d pruned=%d unknown=%d; call-graph nodes=%d; variable summary: total=%d locals=%d globals=%d class-members=%d candidates=%d definitely-dead=%d removed-dead-locals=%d unknown=%d; actual pruning enabled for proven unreachable routines\n",
 			routinecount, reachablecount, removablecount, prunedcount, unknownroutinecount, graphnodes,
-			varcount, localvarcount, globalvarcount, classmembercount, candidatevarcount, unknownvarcount);
+			varcount, localvarcount, globalvarcount, classmembercount, candidatevarcount, deadroutinevarcount, removeddeadlocals, unknownvarcount);
 		dspstring(work);
 	}
 }
@@ -2145,6 +2379,8 @@ INT usepsym(CHAR *symbol, UINT flag)
 			death(DEATH_INTERNAL4);
 	} // end of switch on 'flag'
 	symtableptr->classid = workclsid;
+	symtableptr->rlevel = workrlevel;
+	symtableptr->routineid = rlevelid[workrlevel];
 	if (xrefflg) xrefout(symbol, flag);
 	return(0);
 }
@@ -3042,40 +3278,60 @@ static void writedbc()
 
 	/* write out main data area (along with execution label table) */
 	dataadr++;
-	if (databufhandle) {
-		if (databufcnt) {
-			if (fiowrite(databufhandle, datafilepos, *databuf, (INT) databufcnt) < 0) death(DEATH_BADWRKWRITE);
-			datafilepos += databufcnt;
- 		}
-		datafilepos = 0;
-		do {
-			bytesread = fioread(databufhandle, datafilepos, *databuf, (INT) databufsize);
-			if (bytesread <= 0) break;
-			if (!datafilepos) {
-				(*databuf)[0] = 0x00;				/* tag byte for main data segment */
-				(*databuf)[1] = (UCHAR) totalsegsize;	/* size, in bytes, of data area in .DBC file */
-				(*databuf)[2] = (UCHAR) (totalsegsize >> 8);
-				(*databuf)[3] = (UCHAR) (totalsegsize >> 16);
-				(*databuf)[4] = (UCHAR) dataadr;		/* size, in bytes, of data area at run-time */
-				(*databuf)[5] = (UCHAR) (dataadr >> 8);
-				(*databuf)[6] = (UCHAR) (dataadr >> 16);
+	{
+		INT dataLen = databufhandle ? (INT) (datafilepos + databufcnt) : (INT) databufcnt;
+		UCHAR *dataBlock = NULL, *outBlock = NULL;
+		INT outLen = dataLen;
+		INT compacted = 0;
+		if (dataLen > 0) {
+			dataBlock = (UCHAR *) malloc((size_t) dataLen);
+			if (dataBlock != NULL) {
+				if (databufhandle) {
+					OFFSET pos = 0;
+					if (databufcnt) {
+						if (fiowrite(databufhandle, datafilepos, *databuf, (INT) databufcnt) < 0) death(DEATH_BADWRKWRITE);
+						datafilepos += databufcnt;
+					}
+					datafilepos = 0;
+					while (pos < (OFFSET) dataLen) {
+						bytesread = fioread(databufhandle, pos, dataBlock + pos, dataLen - (INT) pos);
+						if (bytesread <= 0) break;
+						pos += bytesread;
+					}
+					fiokill(databufhandle);
+					databufhandle = 0;
+				}
+				else {
+					memcpy(dataBlock, *databuf, (size_t) dataLen);
+				}
+				if (deadDataRangeCount > 0) {
+					compacted = compactDataAreaBuffer(dataBlock, dataLen, &outBlock, &outLen);
+					if (outBlock != NULL && outBlock != dataBlock) {
+						free(dataBlock);
+						dataBlock = outBlock;
+					}
+					dataadr -= compacted;
+					if (outLen <= 0) outLen = 0;
+					{
+						CHAR work[128];
+						sprintf(work, "optimizer: compacted data-segment from %d to %d bytes\n", dataLen, outLen);
+						dspstring(work);
+					}
+				}
+				if (outLen > 0) {
+					dataBlock[0] = 0x00;
+					dataBlock[1] = (UCHAR) (outLen - 4);
+					dataBlock[2] = (UCHAR) ((UINT) (outLen - 4) >> 8);
+					dataBlock[3] = (UCHAR) ((UINT) (outLen - 4) >> 16);
+					dataBlock[4] = (UCHAR) dataadr;
+					dataBlock[5] = (UCHAR) (dataadr >> 8);
+					dataBlock[6] = (UCHAR) (dataadr >> 16);
+				}
+				if (fiowrite(dbcfilenum, dbcfilepos, dataBlock, outLen) < 0) death(DEATH_BADDBCWRITE);
+				dbcfilepos += outLen;
+				free(dataBlock);
 			}
-			if (fiowrite(dbcfilenum, dbcfilepos, *databuf, bytesread) < 0) death(DEATH_BADDBCWRITE);
-			dbcfilepos += bytesread;
-			datafilepos += bytesread;
-		} while (bytesread == (INT) databufsize);
-		fiokill(databufhandle);
-	}
-	else {
-		(*databuf)[0] = 0x00;				/* tag byte for main data segment */
-		(*databuf)[1] = (UCHAR) totalsegsize;	/* size, in bytes, of data area in .DBC file */
-		(*databuf)[2] = (UCHAR) (totalsegsize >> 8);
-		(*databuf)[3] = (UCHAR) (totalsegsize >> 16);
-		(*databuf)[4] = (UCHAR) dataadr;		/* size, in bytes, of data area at run-time */
-		(*databuf)[5] = (UCHAR) (dataadr >> 8);
-		(*databuf)[6] = (UCHAR) (dataadr >> 16);
-		if (fiowrite(dbcfilenum, dbcfilepos, *databuf, (INT) databufcnt) < 0) death(DEATH_BADDBCWRITE);
-		dbcfilepos += databufcnt;
+		}
 	}
 
 	/* write out external definition table segment */
